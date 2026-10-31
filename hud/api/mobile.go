@@ -10,9 +10,9 @@ import (
 	"os"
 	"time"
 
-	"github.com/charliecharlieO-o/ridedaemon-go/hud/core"
-	"github.com/charliecharlieO-o/ridedaemon-go/hud/stream"
-	"github.com/charliecharlieO-o/ridedaemon-go/internal/logging"
+	"github.com/charliecharlieO-o/motobit-ride-go/hud/core"
+	"github.com/charliecharlieO-o/motobit-ride-go/hud/stream"
+	"github.com/charliecharlieO-o/motobit-ride-go/internal/logging"
 )
 
 // To make BuildAnnexBAUFromAVCC work well:
@@ -255,6 +255,18 @@ func (ms *MobileSession) SetECHost(host *StreamHost) error {
 		return err
 	}
 	return nil
+}
+
+func (ms *MobileSession) SetClockTimeZone(id string, offsetSeconds int) {
+	if ms.hud != nil {
+		ms.hud.SetClockTimeZone(id, offsetSeconds)
+	}
+}
+
+func (ms *MobileSession) SetEarlyClockPush(enabled bool) {
+	if ms.hud != nil {
+		ms.hud.SetEarlyClockPush(enabled)
+	}
 }
 
 func (ms *MobileSession) StartSession() error {

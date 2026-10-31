@@ -9,8 +9,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/charliecharlieO-o/ridedaemon-go/hud/core"
-	"github.com/charliecharlieO-o/ridedaemon-go/hud/stream"
+	"github.com/charliecharlieO-o/motobit-ride-go/hud/core"
+	"github.com/charliecharlieO-o/motobit-ride-go/hud/stream"
 )
 
 const targetFPS = 30

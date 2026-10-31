@@ -1,4 +1,4 @@
-module github.com/charliecharlieO-o/ridedaemon-go
+module github.com/charliecharlieO-o/motobit-ride-go
 
 go 1.25
 

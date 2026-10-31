@@ -10,9 +10,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/charliecharlieO-o/ridedaemon-go/hud/net"
-	"github.com/charliecharlieO-o/ridedaemon-go/hud/stream"
-	"github.com/charliecharlieO-o/ridedaemon-go/internal/logging"
+	"github.com/charliecharlieO-o/motobit-ride-go/hud/net"
+	"github.com/charliecharlieO-o/motobit-ride-go/hud/stream"
+	"github.com/charliecharlieO-o/motobit-ride-go/internal/logging"
 	"github.com/google/uuid"
 	"github.com/grandcat/zeroconf"
 )
@@ -54,6 +54,11 @@ type CfmotoHUD struct {
 	packageName string
 	phoneUUID   uuid.UUID
 	phoneConfig *net.PhoneConfig
+
+	// Clock sync config
+	clockTZID             string
+	clockTZOffset         int
+	earlyClockPushEnabled bool
 
 	// net management
 	keyPair      *net.KeyPair
@@ -97,9 +102,10 @@ func NewCfmotoHUD(targetFPS int, mux *stream.MuxSource) *CfmotoHUD {
 			SupportH264IFrame:     true,
 			AppVersionFingerPrint: "V:2.2.1(121)--ONLINE",
 		},
-		targetFPS: targetFPS,
-		muxSource: mux,
-		stopped:   make(chan any),
+		targetFPS:             targetFPS,
+		earlyClockPushEnabled: true,
+		muxSource:             mux,
+		stopped:               make(chan any),
 		Events:    make(chan HudEvent, 32),
 		Errors:    make(chan error, 32),
 	}
@@ -302,6 +308,17 @@ func (hud *CfmotoHUD) startStream(ctx context.Context, initConn stdnet.Conn) (er
 
 	pxcReady := make(chan any, 1)
 	pxcServer := net.NewPXCControl(":10922", hud.keyPair, hud.phoneConfig)
+	hud.mu.Lock()
+	tzID := hud.clockTZID
+	tzOffset := hud.clockTZOffset
+	earlyPush := hud.earlyClockPushEnabled
+	hud.mu.Unlock()
+
+	if tzID != "" {
+		pxcServer.SetClockTimeZone(tzID, tzOffset)
+	}
+	pxcServer.SetEarlyClockPush(earlyPush)
+
 	// PXC is ready
 	go func() {
 		for event := range pxcServer.Events {
@@ -469,4 +486,27 @@ func (hud *CfmotoHUD) SetHost(host *EcHost) error {
 	}
 	hud.host = host
 	return nil
+}
+
+func (hud *CfmotoHUD) SetClockTimeZone(id string, offsetSeconds int) {
+	hud.mu.Lock()
+	hud.clockTZID = id
+	hud.clockTZOffset = offsetSeconds
+	pxc := hud.pxcControl
+	hud.mu.Unlock()
+
+	if pxc != nil {
+		pxc.SetClockTimeZone(id, offsetSeconds)
+	}
+}
+
+func (hud *CfmotoHUD) SetEarlyClockPush(enabled bool) {
+	hud.mu.Lock()
+	hud.earlyClockPushEnabled = enabled
+	pxc := hud.pxcControl
+	hud.mu.Unlock()
+
+	if pxc != nil {
+		pxc.SetEarlyClockPush(enabled)
+	}
 }

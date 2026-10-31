@@ -7,11 +7,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/charliecharlieO-o/motobit-ride-go/internal/logging"
 	"io"
 	"net"
 	"sync"
-
-	"github.com/charliecharlieO-o/ridedaemon-go/internal/logging"
+	"time"
 )
 
 const mediaCtrlHeaderSize = 8
@@ -121,27 +121,41 @@ func (s *MediaControl) acceptLoop() {
 }
 
 func (s *MediaControl) writeResponse(res *MediaCtrlResponse, conn net.Conn) error {
-	// -- write header
-	if err := binary.Write(conn, binary.LittleEndian, res.Command); err != nil {
-		return err
-	}
-	if err := binary.Write(conn, binary.LittleEndian, res.Size); err != nil {
-		return err
-	}
-	if err := binary.Write(conn, binary.LittleEndian, res.Padding); err != nil {
-		return err
-	}
-
-	// -- write payload
-	if len(res.Payload) > 0 {
-		if _, err := conn.Write(res.Payload); err != nil {
-			return err
+	// DIAG_RIDEDAEMON: risposta MediaControl inviata
+	if res != nil {
+		payloadPreview := res.Payload
+		if len(payloadPreview) > 256 {
+			payloadPreview = payloadPreview[:256]
 		}
+		logging.Printf("DIAG_RIDEDAEMON MEDIA_TX time=%s remote=%s cmd=%d size=%d payloadLen=%d payloadHex=%x payloadText=%q",
+			time.Now().Format(time.RFC3339Nano), conn.RemoteAddr(),
+			res.Command, res.Size, len(res.Payload),
+			payloadPreview, string(payloadPreview))
+	}
+	// Pacchetto costruito in memoria e inviato con UNA SOLA Write: piu' Write
+	// separate potrebbero intercalarsi con un altro scrittore sulla stessa
+	// connessione e corrompere il pacchetto.
+	buf := make([]byte, 0, mediaCtrlHeaderSize+len(res.Payload))
+	buf = binary.LittleEndian.AppendUint16(buf, res.Command)
+	buf = binary.LittleEndian.AppendUint16(buf, res.Size)
+	buf = binary.LittleEndian.AppendUint32(buf, res.Padding)
+	buf = append(buf, res.Payload...)
+	if _, err := conn.Write(buf); err != nil {
+		return fmt.Errorf("WRITE_ERROR: %w", err)
 	}
 	return nil
 }
 
 func (s *MediaControl) handleEvent(event *MediaCtrlResponse, conn net.Conn) {
+	// DIAG_RIDEDAEMON: comando MediaControl ricevuto
+	payloadPreview := event.Payload
+	if len(payloadPreview) > 256 {
+		payloadPreview = payloadPreview[:256]
+	}
+	logging.Printf("DIAG_RIDEDAEMON MEDIA_RX time=%s remote=%s cmd=%d size=%d payloadLen=%d payloadHex=%x payloadText=%q",
+		time.Now().Format(time.RFC3339Nano), conn.RemoteAddr(),
+		event.Command, event.Size, len(event.Payload),
+		payloadPreview, string(payloadPreview))
 	switch event.Command {
 	case MediaCtrlInit:
 		s.emitEvent(*event)

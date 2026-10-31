@@ -11,8 +11,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/charliecharlieO-o/ridedaemon-go/hud/stream"
-	"github.com/charliecharlieO-o/ridedaemon-go/internal/logging"
+	"github.com/charliecharlieO-o/motobit-ride-go/hud/stream"
+	"github.com/charliecharlieO-o/motobit-ride-go/internal/logging"
 )
 
 type connectionState struct {
@@ -218,6 +218,10 @@ func (s *MediaStream) handleConn(conn net.Conn) {
 		}
 
 		st.pollCount++
+		if st.pollCount == 1 {
+			logging.Printf("DIAG_RIDEDAEMON VIDEO_FIRST_POLL time=%s cmd=0x%04x",
+				time.Now().Format(time.RFC3339Nano), cmd)
+		}
 
 		body, err := s.src.NextFrame(time.Now())
 		if err != nil {
@@ -265,6 +269,10 @@ func (s *MediaStream) handleConn(conn net.Conn) {
 
 		// Legacy pacing - 4B len + 4B idx + body
 		frame, idx := buildFramedPacket(body, st.frameCounter)
+		if st.frameCounter == 0 {
+			logging.Printf("DIAG_RIDEDAEMON VIDEO_FIRST_FRAME time=%s idx=%d bodyBytes=%d frameBytes=%d",
+				time.Now().Format(time.RFC3339Nano), idx, len(body), len(frame))
+		}
 		st.frameCounter = (st.frameCounter + 1) & 0x7FFFFFFF
 
 		// Send it chunked, send it paced

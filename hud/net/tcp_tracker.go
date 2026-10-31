@@ -28,6 +28,17 @@ func (t *ConnTracker) Remove(conn net.Conn) {
 	t.mu.Unlock()
 }
 
+func (t *ConnTracker) Snapshot() []net.Conn {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	conns := make([]net.Conn, 0, len(t.connections))
+	for c := range t.connections {
+		conns = append(conns, c)
+	}
+	return conns
+}
+
 func (t *ConnTracker) CloseAll() {
 	t.mu.Lock()
 	defer t.mu.Unlock()

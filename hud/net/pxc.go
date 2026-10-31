@@ -8,11 +8,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/charliecharlieO-o/motobit-ride-go/internal/logging"
 	"io"
 	"net"
 	"sync"
-
-	"github.com/charliecharlieO-o/ridedaemon-go/internal/logging"
+	"time"
 )
 
 // This protocol is not so weird, it has a 16 byte header plus payload
@@ -35,6 +35,7 @@ const (
 	PxcOtaFtpInfo       uint32 = 0x103a0
 	PxcMediaFeatureConf uint32 = 0x10020
 	PxcCheckSnResult    uint32 = 0x201c0
+	PxcTimeSync         uint32 = 0x10450
 )
 
 // Command responses
@@ -46,6 +47,7 @@ const (
 	PxcClientOk    uint32 = 66529
 	PxcCheckSnAck  uint32 = PxcClientSet + 1
 	PxcCheckSnDone uint32 = PxcCheckSnResult + 1
+	PxcTimeSyncAck uint32 = PxcTimeSync + 1
 )
 
 type checkSnRequest struct {
@@ -149,6 +151,12 @@ type PXCControl struct {
 	listener net.Listener
 	tracker  *ConnTracker
 
+	clockMu          sync.Mutex
+	clockTZID        string
+	clockTZOffset    int
+	earlyPushOnce    sync.Once
+	earlyPushEnabled bool
+
 	stopOnce sync.Once
 
 	Events      chan PXCResponse
@@ -160,13 +168,14 @@ type PXCControl struct {
 
 func NewPXCControl(port string, kp *KeyPair, config *PhoneConfig) *PXCControl {
 	return &PXCControl{
-		port:        port,
-		quit:        make(chan any),
-		tracker:     NewConnTracker(),
-		Events:      make(chan PXCResponse, 16),
-		Errors:      make(chan error, 16),
-		KeyPair:     kp,
-		PhoneConfig: config,
+		port:             port,
+		quit:             make(chan any),
+		tracker:          NewConnTracker(),
+		Events:           make(chan PXCResponse, 16),
+		Errors:           make(chan error, 16),
+		KeyPair:          kp,
+		PhoneConfig:      config,
+		earlyPushEnabled: true,
 	}
 }
 
@@ -224,6 +233,20 @@ func (s *PXCControl) buildPC() error {
 }
 
 func (s *PXCControl) writeResponse(res *PXCResponse, conn net.Conn, raw *[]byte) error {
+	// DIAG_RIDEDAEMON: risposta PXC inviata
+	if res != nil {
+		bodyPreview := res.Body
+		if len(bodyPreview) > 256 {
+			bodyPreview = bodyPreview[:256]
+		}
+		logging.Printf("DIAG_RIDEDAEMON PXC_TX time=%s remote=%s cmd=%d cmdHex=0x%x bodyLen=%d bodyHex=%x bodyText=%q",
+			time.Now().Format(time.RFC3339Nano), conn.RemoteAddr(),
+			res.Command, res.Command, len(res.Body),
+			bodyPreview, string(bodyPreview))
+	} else if raw != nil {
+		logging.Printf("DIAG_RIDEDAEMON PXC_TX_RAW time=%s remote=%s bytes=%d",
+			time.Now().Format(time.RFC3339Nano), conn.RemoteAddr(), len(*raw))
+	}
 	if raw == nil && res != nil {
 		// -- build header
 		res.Token = 0 // Padding is always 0 for responses
@@ -233,29 +256,25 @@ func (s *PXCControl) writeResponse(res *PXCResponse, conn net.Conn, raw *[]byte)
 		}
 		res.Magic = res.Size ^ res.Command
 
-		// -- write header
-		if err := binary.Write(conn, binary.LittleEndian, res.Command); err != nil {
-			return err
-		}
-		if err := binary.Write(conn, binary.LittleEndian, res.Size); err != nil {
-			return err
-		}
-		if err := binary.Write(conn, binary.LittleEndian, res.Magic); err != nil {
-			return err
-		}
-		if err := binary.Write(conn, binary.LittleEndian, res.Token); err != nil {
-			return err
-		}
-
-		// -- write body
-		if len(res.Body) > 0 {
-			if _, err := conn.Write(res.Body); err != nil {
-				return err
-			}
+		// Pacchetto costruito in memoria e inviato con UNA SOLA Write.
+		//
+		// Sulla stessa connessione possono scrivere DUE goroutine: quella che
+		// serve i comandi del TFT e quella del clock push. Con Write separate
+		// (una per campo dell'header, una per il corpo) i pezzi si intercalano e
+		// il TFT riceve un pacchetto corrotto. Una singola Write su un socket TCP
+		// e' atomica rispetto alle altre Write dello stesso socket.
+		buf := make([]byte, 0, int(res.Size))
+		buf = binary.LittleEndian.AppendUint32(buf, res.Command)
+		buf = binary.LittleEndian.AppendUint32(buf, res.Size)
+		buf = binary.LittleEndian.AppendUint32(buf, res.Magic)
+		buf = binary.LittleEndian.AppendUint32(buf, res.Token)
+		buf = append(buf, res.Body...)
+		if _, err := conn.Write(buf); err != nil {
+			return fmt.Errorf("WRITE_ERROR: %w", err)
 		}
 	} else if raw != nil {
 		if _, err := conn.Write(*raw); err != nil {
-			return err
+			return fmt.Errorf("WRITE_ERROR: %w", err)
 		}
 	}
 
@@ -263,6 +282,15 @@ func (s *PXCControl) writeResponse(res *PXCResponse, conn net.Conn, raw *[]byte)
 }
 
 func (s *PXCControl) handleEvent(event *PXCResponse, conn net.Conn) {
+	// DIAG_RIDEDAEMON: comando PXC ricevuto
+	bodyPreview := event.Body
+	if len(bodyPreview) > 256 {
+		bodyPreview = bodyPreview[:256]
+	}
+	logging.Printf("DIAG_RIDEDAEMON PXC_RX time=%s remote=%s cmd=%d cmdHex=0x%x size=%d magic=0x%x token=%d bodyLen=%d bodyHex=%x bodyText=%q",
+		time.Now().Format(time.RFC3339Nano), conn.RemoteAddr(),
+		event.Command, event.Command, event.Size, event.Magic, event.Token,
+		len(event.Body), bodyPreview, string(bodyPreview))
 	switch event.Command {
 	case PxcHandshake:
 		response := &PXCResponse{Command: PxcHandshakeOk}
@@ -297,6 +325,7 @@ func (s *PXCControl) handleEvent(event *PXCResponse, conn net.Conn) {
 				break
 			}
 			s.emitEvent(*response)
+			s.startEarlyClockPush()
 		}
 	case PxcSpeedConf:
 		s.emitEvent(*event)
@@ -346,6 +375,12 @@ func (s *PXCControl) handleEvent(event *PXCResponse, conn net.Conn) {
 	case PxcCheckSnDone:
 		// The bike acknowledges the phone-originated CHECK_SN_RESULT.
 		s.emitEvent(*event)
+	case PxcTimeSync:
+		s.emitEvent(*event)
+		response := &PXCResponse{Command: PxcTimeSyncAck, Body: s.BuildClockReply()}
+		if err := s.writeResponse(response, conn, nil); err != nil {
+			s.emitError(&PxcError{PxcWriteErr, err, true})
+		}
 	default:
 		if event.Command&1 == 0 {
 			// Unknown even commands are requests. CFDL26 uses several JSON and
@@ -429,7 +464,7 @@ func (s *PXCControl) handleConn(conn net.Conn) {
 		if n, err := io.ReadFull(reader, headerBytes); err != nil {
 			s.emitError(&PxcError{
 				PxcDecodeErr,
-				fmt.Errorf("error reading header: %v (read %d bytes: %x)", err, n, headerBytes[:n]),
+				fmt.Errorf("%s: %v (read %d bytes: %x)", classifyReadErr(err), err, n, headerBytes[:n]),
 				true,
 			})
 			return
@@ -447,7 +482,14 @@ func (s *PXCControl) handleConn(conn net.Conn) {
 
 		// Sanity check
 		if request.Magic != request.Size^request.Command {
-			logging.Printf("Sanity check failed: %d %d", request.Magic, request.Command)
+			s.emitError(&PxcError{
+				PxcDecodeErr,
+				fmt.Errorf(
+					"PROTOCOL_ERROR: magic check failed (magic=0x%x size=%d cmd=0x%x)",
+					request.Magic, request.Size, request.Command,
+				),
+				true,
+			})
 			return
 		}
 
@@ -458,7 +500,10 @@ func (s *PXCControl) handleConn(conn net.Conn) {
 			if _, err := io.ReadFull(reader, payload); err != nil {
 				s.emitError(&PxcError{
 					PxcDecodeErr,
-					fmt.Errorf("[PXCService] read payload failed from %s: %v", conn.RemoteAddr(), err),
+					fmt.Errorf(
+						"%s: read payload failed from %s: %v",
+						classifyReadErr(err), conn.RemoteAddr(), err,
+					),
 					true,
 				})
 				return
@@ -469,6 +514,25 @@ func (s *PXCControl) handleConn(conn net.Conn) {
 		// Decide what to do with the event
 		s.handleEvent(request, conn)
 	}
+}
+
+// classifyReadErr distingue la causa di una lettura fallita, cosi' il log dice
+// chi ha interrotto la sessione invece di un generico errore di lettura.
+func classifyReadErr(err error) string {
+	switch {
+	case errors.Is(err, io.EOF):
+		return "REMOTE_CLOSE"
+	case errors.Is(err, io.ErrUnexpectedEOF):
+		return "REMOTE_CLOSE_PARTIAL"
+	case errors.Is(err, net.ErrClosed):
+		return "LOCAL_STOP"
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return "READ_TIMEOUT"
+	}
+	return "READ_ERROR"
 }
 
 func (s *PXCControl) Stop(ctx context.Context) error {

@@ -1,10 +1,13 @@
 package net
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"io"
 	stdnet "net"
+	"sync"
 	"testing"
 	"time"
 )
@@ -63,6 +66,93 @@ func TestUnknownOddPXCResponseIsNotAcknowledged(t *testing.T) {
 		t.Fatal("unknown odd PXC response unexpectedly produced an ACK")
 	}
 	assertNoPXCError(t, control)
+}
+
+func TestPxcTimeSyncResponse(t *testing.T) {
+	control := NewPXCControl(":0", nil, nil)
+	control.SetClockTimeZone("Europe/Rome", 7200)
+
+	responses := handlePXCEventAndReadResponses(t, control, &PXCResponse{
+		Command: PxcTimeSync,
+	}, 1)
+
+	if responses[0].Command != PxcTimeSyncAck {
+		t.Fatalf("PXC_TIME_SYNC ACK command = 0x%x, want 0x%x", responses[0].Command, PxcTimeSyncAck)
+	}
+
+	var reply clockReply
+	if err := json.Unmarshal(responses[0].Body, &reply); err != nil {
+		t.Fatalf("decode PXC_TIME_SYNC reply: %v", err)
+	}
+
+	if reply.CurrentTimeZone != "Europe/Rome" {
+		t.Fatalf("unexpected currentTimeZone: %s", reply.CurrentTimeZone)
+	}
+	if reply.Time <= 0 || reply.CurrentTime <= 0 {
+		t.Fatalf("invalid timestamps: time=%d currentTime=%d", reply.Time, reply.CurrentTime)
+	}
+	if reply.DateTime == "" {
+		t.Fatal("dateTime is empty")
+	}
+	assertNoPXCError(t, control)
+}
+
+// TestPXCConcurrentWritesDoNotInterleave verifica che due goroutine che
+// rispondono sulla STESSA connessione non corrompano i pacchetti.
+// Con il vecchio codice (una Write per campo dell'header + una per il corpo) i
+// pezzi si intercalavano e il magic check falliva: era la causa sospetta delle
+// disconnessioni durante il clock push.
+func TestPXCConcurrentWritesDoNotInterleave(t *testing.T) {
+	client, server := stdnet.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	control := NewPXCControl(":0", nil, nil)
+	body := []byte("0123456789ABCDEF")
+	const perWriter = 300
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < perWriter; i++ {
+			_ = control.writeResponse(&PXCResponse{Command: PxcHandshakeOk, Body: body}, client, nil)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < perWriter; i++ {
+			_ = control.writeResponse(&PXCResponse{Command: PxcTimeSyncAck, Body: body}, client, nil)
+		}
+	}()
+
+	reader := bufio.NewReader(server)
+	for read := 0; read < 2*perWriter; read++ {
+		header := make([]byte, pxcHeaderSize)
+		if _, err := io.ReadFull(reader, header); err != nil {
+			t.Fatalf("lettura header %d: %v", read, err)
+		}
+		cmd := binary.LittleEndian.Uint32(header[0:4])
+		size := binary.LittleEndian.Uint32(header[4:8])
+		magic := binary.LittleEndian.Uint32(header[8:12])
+
+		if size != uint32(pxcHeaderSize+len(body)) {
+			t.Fatalf("pacchetto %d: size=%d (atteso %d)", read, size, pxcHeaderSize+len(body))
+		}
+		if magic != size^cmd {
+			t.Fatalf("pacchetto %d CORROTTO: magic=0x%x atteso 0x%x", read, magic, size^cmd)
+		}
+
+		payload := make([]byte, size-uint32(pxcHeaderSize))
+		if _, err := io.ReadFull(reader, payload); err != nil {
+			t.Fatalf("lettura body %d: %v", read, err)
+		}
+		if !bytes.Equal(payload, body) {
+			t.Fatalf("pacchetto %d: body corrotto %q", read, payload)
+		}
+	}
+
+	wg.Wait()
 }
 
 func handlePXCEventAndReadResponses(
