@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -36,6 +37,12 @@ const (
 	PxcMediaFeatureConf uint32 = 0x10020
 	PxcCheckSnResult    uint32 = 0x201c0
 	PxcTimeSync         uint32 = 0x10450
+	// PxcTftKeepalive e' la richiesta periodica (~ogni 110s) che il TFT invia
+	// sulla socket dell'handshake con un body di ~68B. Non documentata: il
+	// test sul campo (1.0.24) ha mostrato che rispondere con payload non
+	// cambia la sorte della socket, quindi si mantiene l'ACK a body vuoto
+	// storico. Il case dedicato resta solo per il dump esadecimale diagnostico.
+	PxcTftKeepalive uint32 = 0x10630
 )
 
 // Command responses
@@ -150,12 +157,16 @@ type PXCControl struct {
 	wg       sync.WaitGroup
 	listener net.Listener
 	tracker  *ConnTracker
+	diag     *ChannelDiagnostics
 
 	clockMu          sync.Mutex
 	clockTZID        string
 	clockTZOffset    int
 	earlyPushOnce    sync.Once
 	earlyPushEnabled bool
+	// Numero di push della raffica iniziale (vedi clocksync.go): configurabile
+	// per bisezione, default defaultClockPushCount.
+	clockPushCount int
 
 	stopOnce sync.Once
 
@@ -171,13 +182,19 @@ func NewPXCControl(port string, kp *KeyPair, config *PhoneConfig) *PXCControl {
 		port:             port,
 		quit:             make(chan any),
 		tracker:          NewConnTracker(),
+		diag:             NewChannelDiagnostics(),
 		Events:           make(chan PXCResponse, 16),
 		Errors:           make(chan error, 16),
 		KeyPair:          kp,
 		PhoneConfig:      config,
 		earlyPushEnabled: true,
+		// Raffica iniziale dell'ora: default noto-good della 1.0.18,
+		// ridebugile via SetClockPushCount per la bisezione.
+		clockPushCount: defaultClockPushCount,
 	}
 }
+
+func (s *PXCControl) ChannelDiagnostics() *ChannelDiagnostics { return s.diag }
 
 func (s *PXCControl) emitEvent(evt PXCResponse) {
 	select {
@@ -270,12 +287,16 @@ func (s *PXCControl) writeResponse(res *PXCResponse, conn net.Conn, raw *[]byte)
 		buf = binary.LittleEndian.AppendUint32(buf, res.Token)
 		buf = append(buf, res.Body...)
 		if _, err := conn.Write(buf); err != nil {
+			s.recordDiagError("WRITE_ERROR", err)
 			return fmt.Errorf("WRITE_ERROR: %w", err)
 		}
+		s.recordDiagTx(res.Command, uint64(len(buf)), conn.RemoteAddr().String())
 	} else if raw != nil {
 		if _, err := conn.Write(*raw); err != nil {
+			s.recordDiagError("WRITE_ERROR", err)
 			return fmt.Errorf("WRITE_ERROR: %w", err)
 		}
+		s.recordDiagTx(0, uint64(len(*raw)), conn.RemoteAddr().String())
 	}
 
 	return nil
@@ -325,7 +346,9 @@ func (s *PXCControl) handleEvent(event *PXCResponse, conn net.Conn) {
 				break
 			}
 			s.emitEvent(*response)
-			s.startEarlyClockPush()
+			// Consegna dell'ora una volta per connessione (vedi clocksync.go):
+			// il TFT imposta l'orario solo da un push non sollecitato.
+			s.sendClockPushOnConnect()
 		}
 	case PxcSpeedConf:
 		s.emitEvent(*event)
@@ -381,6 +404,27 @@ func (s *PXCControl) handleEvent(event *PXCResponse, conn net.Conn) {
 		if err := s.writeResponse(response, conn, nil); err != nil {
 			s.emitError(&PxcError{PxcWriteErr, err, true})
 		}
+	case PxcTftKeepalive:
+		// Richiesta periodica del TFT (~ogni 110s, body di ~68B). Testato sul
+		// campo (1.0.24): rispondere con payload NON cambia la sorte della
+		// socket (muore comunque a ~14.5 min; la riconnessione preventiva e'
+		// affidata all'app), quindi si torna all'ACK a body vuoto storico, che e'
+		// il comportamento con cui il TFT ha sempre funzionato prima del burst.
+		// Il dump esadecimale resta: costa nulla e serve a risalire allo schema
+		// di questa richiesta se un domani servisse capirla davvero.
+		dumpLen := len(event.Body)
+		if dumpLen > 96 {
+			dumpLen = 96
+		}
+		logging.Printf(
+			"PxcTftKeepalive (0x10630) request bodyBytes=%d hex=%s",
+			len(event.Body), hex.EncodeToString(event.Body[:dumpLen]),
+		)
+		s.emitEvent(*event)
+		response := &PXCResponse{Command: PxcTftKeepalive + 1}
+		if err := s.writeResponse(response, conn, nil); err != nil {
+			s.emitError(&PxcError{PxcWriteErr, err, true})
+		}
 	default:
 		if event.Command&1 == 0 {
 			// Unknown even commands are requests. CFDL26 uses several JSON and
@@ -419,6 +463,10 @@ func (s *PXCControl) Start() error {
 	s.wg.Add(1)
 	go s.acceptLoop()
 
+	// Clock push continuativo: un PxcTimeSyncAck ogni keepaliveClockPushPeriod
+	// su tutte le connessioni attive, per non far scattare il watchdog del TFT.
+	s.startKeepaliveClockPush()
+
 	return nil
 }
 
@@ -446,11 +494,25 @@ func (s *PXCControl) acceptLoop() {
 // Handling a single TCP connection
 func (s *PXCControl) handleConn(conn net.Conn) {
 	s.tracker.Add(conn)
+	s.diag.OpenConn(conn.LocalAddr().String(), conn.RemoteAddr().String(), conn)
+	closeReason := "REMOTE_OR_LOCAL_CLOSE"
 	defer func() {
+		// Chiusura per-connessione: qui sappiamo quale socket si e' chiusa
+		// e non azzariamo anche le altre.
+		s.diag.CloseConn(conn.RemoteAddr().String(), closeReason)
 		s.tracker.Remove(conn)
 		_ = conn.Close()
 		s.wg.Done()
 	}()
+
+	// Keepalive TCP: senza probe il kernel impiega molti minuti a dichiarare
+	// morta una connessione non-ACKata, e nel frattempo il TFT considera
+	// compromessa l'intera sessione e chiude lo streaming. Probe brevi
+	// (15 s di inattivita') per accorciare la rilevazione.
+	if tcp, ok := conn.(*net.TCPConn); ok {
+		_ = tcp.SetKeepAlive(true)
+		_ = tcp.SetKeepAlivePeriod(15 * time.Second)
+	}
 
 	reader := bufio.NewReader(conn)
 
@@ -462,6 +524,8 @@ func (s *PXCControl) handleConn(conn net.Conn) {
 		// Read the 16 byte header
 		headerBytes := make([]byte, pxcHeaderSize)
 		if n, err := io.ReadFull(reader, headerBytes); err != nil {
+			closeReason = classifyReadErr(err)
+			s.recordDiagError(closeReason, err)
 			s.emitError(&PxcError{
 				PxcDecodeErr,
 				fmt.Errorf("%s: %v (read %d bytes: %x)", classifyReadErr(err), err, n, headerBytes[:n]),
@@ -482,6 +546,8 @@ func (s *PXCControl) handleConn(conn net.Conn) {
 
 		// Sanity check
 		if request.Magic != request.Size^request.Command {
+			closeReason = "PROTOCOL_ERROR"
+			s.recordDiagError(closeReason, fmt.Errorf("magic=0x%x size=%d cmd=0x%x", request.Magic, request.Size, request.Command))
 			s.emitError(&PxcError{
 				PxcDecodeErr,
 				fmt.Errorf(
@@ -498,6 +564,8 @@ func (s *PXCControl) handleConn(conn net.Conn) {
 		if request.Size > 0 {
 			payload = make([]byte, request.Size-pxcHeaderSize)
 			if _, err := io.ReadFull(reader, payload); err != nil {
+				closeReason = classifyReadErr(err)
+				s.recordDiagError(closeReason, err)
 				s.emitError(&PxcError{
 					PxcDecodeErr,
 					fmt.Errorf(
@@ -511,6 +579,10 @@ func (s *PXCControl) handleConn(conn net.Conn) {
 			request.Body = payload
 		}
 
+		// Aggiorna solo contatori e timestamp monotoni, senza inoltrare i singoli
+		// eventi PXC (il TFT puo' inviare 0x80000010 a frequenza molto alta).
+		s.recordDiagRx(request.Command, uint64(pxcHeaderSize+len(payload)), conn.RemoteAddr().String())
+
 		// Decide what to do with the event
 		s.handleEvent(request, conn)
 	}
@@ -518,6 +590,30 @@ func (s *PXCControl) handleConn(conn net.Conn) {
 
 // classifyReadErr distingue la causa di una lettura fallita, cosi' il log dice
 // chi ha interrotto la sessione invece di un generico errore di lettura.
+func ageString(now, then time.Time) string {
+	if then.IsZero() {
+		return "never"
+	}
+	return (now.Sub(then).Round(time.Millisecond)).String()
+}
+
+func (s *PXCControl) recordDiagError(kind string, err error) {
+	s.diag.Error(kind, err)
+}
+
+func (s *PXCControl) recordDiagRx(cmd uint32, size uint64, peer string) {
+	s.diag.RX(cmd, size, peer)
+}
+
+func (s *PXCControl) recordDiagTx(cmd uint32, size uint64, peer string) {
+	s.diag.TX(cmd, size, peer)
+}
+
+// DiagnosticsSnapshot restituisce solo il riepilogo PXC aggregato.
+func (s *PXCControl) DiagnosticsSnapshot() string {
+	return s.diag.Snapshot(time.Now(), s.diag.ActiveConnections())
+}
+
 func classifyReadErr(err error) string {
 	switch {
 	case errors.Is(err, io.EOF):

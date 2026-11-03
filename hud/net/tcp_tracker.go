@@ -39,6 +39,12 @@ func (t *ConnTracker) Snapshot() []net.Conn {
 	return conns
 }
 
+func (t *ConnTracker) Len() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return len(t.connections)
+}
+
 func (t *ConnTracker) CloseAll() {
 	t.mu.Lock()
 	defer t.mu.Unlock()

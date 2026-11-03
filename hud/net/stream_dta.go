@@ -82,6 +82,7 @@ type MediaStream struct {
 	wg       sync.WaitGroup
 	listener net.Listener
 	tracker  *ConnTracker
+	diag     *ChannelDiagnostics
 
 	stopOnce sync.Once
 
@@ -101,12 +102,15 @@ func NewMediaStream(port string, src stream.FrameSource, chunkSize int, chunkSle
 		port:       port,
 		quit:       make(chan any),
 		tracker:    NewConnTracker(),
+		diag:       NewChannelDiagnostics(),
 		Errors:     make(chan error, 16),
 		src:        src,
 		chunkSize:  chunkSize,
 		chunkSleep: chunkSleep,
 	}
 }
+
+func (s *MediaStream) ChannelDiagnostics() *ChannelDiagnostics { return s.diag }
 
 func (s *MediaStream) emitError(err error) {
 	select {
@@ -140,16 +144,22 @@ func (s *MediaStream) acceptLoop() {
 // Handling individual TCP Connection/Client
 func (s *MediaStream) handleConn(conn net.Conn) {
 	s.tracker.Add(conn)
+	s.diag.OpenConn(conn.LocalAddr().String(), conn.RemoteAddr().String(), conn)
+	closeReason := "REMOTE_OR_LOCAL_CLOSE"
 	defer func() {
+		s.diag.Close(closeReason)
 		s.tracker.Remove(conn)
 		_ = conn.Close()
 		s.wg.Done()
 	}()
 
-	// Keep a fast & stead connection
+	// Keep a fast & stead connection. Il periodo breve serve: il default
+	// (>2h) non produce probe utile e il kernel dichiara morta la connessione
+	// solo dopo molti minuti di ritrasmissioni non-ACKate.
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
 		_ = tcpConn.SetNoDelay(true)
 		_ = tcpConn.SetKeepAlive(true)
+		_ = tcpConn.SetKeepAlivePeriod(15 * time.Second)
 	}
 
 	input := bufio.NewReaderSize(conn, 8*1024)
@@ -173,6 +183,8 @@ func (s *MediaStream) handleConn(conn net.Conn) {
 	for {
 		// Read 8 bytes (poll header)
 		if _, err := io.ReadFull(input, header); err != nil {
+			closeReason = classifyReadErr(err)
+			s.diag.Error(closeReason, err)
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 				s.emitError(&StrmError{
 					StrmDecodeErr,
@@ -190,15 +202,22 @@ func (s *MediaStream) handleConn(conn net.Conn) {
 		}
 
 		cmd := binary.LittleEndian.Uint16(header[0:2])
+		s.diag.RX(uint32(cmd), uint64(len(header)), conn.RemoteAddr().String())
+		if cmd == 0x0072 {
+			s.diag.Poll()
+		}
 
 		if cmd != 0x0072 {
 			// Not a poll pacing command, discard and send idle 0's
+			s.diag.Error("PROTOCOL_ERROR", fmt.Errorf("unexpected MediaStream command 0x%04x", cmd))
 			s.emitError(&StrmError{
 				StrmUnknownCommandErr,
 				fmt.Errorf("non-0x0072 cmd %04x, sending idle", cmd),
 				false,
 			})
 			if _, err := output.Write(zero4); err != nil {
+				closeReason = "WRITE_ERROR"
+				s.diag.Error(closeReason, err)
 				s.emitError(&StrmError{
 					StrmWriteErr,
 					fmt.Errorf("error writing idle: %v", err),
@@ -207,6 +226,8 @@ func (s *MediaStream) handleConn(conn net.Conn) {
 				return
 			}
 			if err := output.Flush(); err != nil {
+				closeReason = "WRITE_ERROR"
+				s.diag.Error(closeReason, err)
 				s.emitError(&StrmError{
 					StrmWriteErr,
 					fmt.Errorf("error flushing idle: %v", err),
@@ -214,6 +235,8 @@ func (s *MediaStream) handleConn(conn net.Conn) {
 				})
 				return
 			}
+			s.diag.IdleReply()
+			s.diag.TX(0, uint64(len(zero4)), conn.RemoteAddr().String())
 			continue
 		}
 
@@ -225,9 +248,12 @@ func (s *MediaStream) handleConn(conn net.Conn) {
 
 		body, err := s.src.NextFrame(time.Now())
 		if err != nil {
+			s.diag.SourceError(err)
 			s.emitError(&StrmError{StrmUnknownCommandErr, fmt.Errorf("error reading frame: %v", err), false})
 			// we will send an idle 0s body so the connection stays open
 			if _, err = output.Write(zero4); err != nil {
+				closeReason = "WRITE_ERROR"
+				s.diag.Error(closeReason, err)
 				s.emitError(&StrmError{
 					StrmWriteErr,
 					fmt.Errorf("MediaStream: error writing idle after src failure: %v", err),
@@ -236,6 +262,8 @@ func (s *MediaStream) handleConn(conn net.Conn) {
 				return
 			}
 			if err = output.Flush(); err != nil {
+				closeReason = "WRITE_ERROR"
+				s.diag.Error(closeReason, err)
 				s.emitError(&StrmError{
 					StrmWriteErr,
 					fmt.Errorf("MediaStream: error flushing idle after src failure: %v", err),
@@ -243,12 +271,16 @@ func (s *MediaStream) handleConn(conn net.Conn) {
 				})
 				return
 			}
+			s.diag.TX(0, uint64(len(zero4)), conn.RemoteAddr().String())
 			continue
 		}
 
 		// If no payload is available, send idle 0s
 		if body == nil || len(body) == 0 {
+			s.diag.IdleReply()
 			if _, err = output.Write(zero4); err != nil {
+				closeReason = "WRITE_ERROR"
+				s.diag.Error(closeReason, err)
 				s.emitError(&StrmError{
 					StrmWriteErr,
 					fmt.Errorf("error writing idle: %v", err),
@@ -257,6 +289,8 @@ func (s *MediaStream) handleConn(conn net.Conn) {
 				return
 			}
 			if err = output.Flush(); err != nil {
+				closeReason = "WRITE_ERROR"
+				s.diag.Error(closeReason, err)
 				s.emitError(&StrmError{
 					StrmWriteErr,
 					fmt.Errorf("flush error (idle): %v", err),
@@ -264,6 +298,7 @@ func (s *MediaStream) handleConn(conn net.Conn) {
 				})
 				return
 			}
+			s.diag.TX(0, uint64(len(zero4)), conn.RemoteAddr().String())
 			continue
 		}
 
@@ -277,6 +312,8 @@ func (s *MediaStream) handleConn(conn net.Conn) {
 
 		// Send it chunked, send it paced
 		if err = sendChunked(output, frame, s.chunkSize, s.chunkSleep); err != nil {
+			closeReason = "WRITE_ERROR"
+			s.diag.Error(closeReason, err)
 			s.emitError(&StrmError{
 				StrmWriteErr,
 				fmt.Errorf("error sending chunks (idx=%d): %v", idx, err),
@@ -284,6 +321,8 @@ func (s *MediaStream) handleConn(conn net.Conn) {
 			})
 			return
 		}
+		s.diag.VideoFrame()
+		s.diag.TX(0x0072, uint64(len(frame)), conn.RemoteAddr().String())
 	}
 }
 

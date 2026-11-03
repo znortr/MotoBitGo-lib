@@ -5,12 +5,36 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"io"
 	stdnet "net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+func TestPXCDiagnosticsSnapshotIncludesErrorsAndConnections(t *testing.T) {
+	control := NewPXCControl(":0", nil, nil)
+	control.diag.Open("192.168.13.20:10922", "192.168.13.1:54612")
+	control.recordDiagRx(PxcHeartbeat, 16, "192.168.13.1:54612")
+	control.recordDiagTx(PxcHeartbeatOk, 16, "192.168.13.1:54612")
+	control.recordDiagError("READ_TIMEOUT", errors.New("read timed out"))
+
+	snapshot := control.DiagnosticsSnapshot()
+	for _, expected := range []string{
+		"conn=1 open=1 close=0",
+		"rx=1/16B",
+		"tx=1/16B",
+		"cmd=0x70000000",
+		"cmd=0x70000001",
+		"lastError=\"READ_TIMEOUT: read timed out\"",
+	} {
+		if !strings.Contains(snapshot, expected) {
+			t.Errorf("snapshot %q missing %q", snapshot, expected)
+		}
+	}
+}
 
 func TestUnknownEvenPXCRequestWithBodyIsAcknowledged(t *testing.T) {
 	control := NewPXCControl(":0", nil, nil)

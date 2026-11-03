@@ -54,6 +54,7 @@ type MediaControl struct {
 	wg       sync.WaitGroup
 	listener net.Listener
 	tracker  *ConnTracker
+	diag     *ChannelDiagnostics
 
 	stopOnce sync.Once
 
@@ -67,10 +68,13 @@ func NewMediaControl(port string) *MediaControl {
 		port:    port,
 		quit:    make(chan any),
 		tracker: NewConnTracker(),
+		diag:    NewChannelDiagnostics(),
 		Errors:  make(chan error, 16),
 		Events:  make(chan MediaCtrlResponse, 16),
 	}
 }
+
+func (s *MediaControl) ChannelDiagnostics() *ChannelDiagnostics { return s.diag }
 
 func (s *MediaControl) emitEvent(evt MediaCtrlResponse) {
 	select {
@@ -141,8 +145,10 @@ func (s *MediaControl) writeResponse(res *MediaCtrlResponse, conn net.Conn) erro
 	buf = binary.LittleEndian.AppendUint32(buf, res.Padding)
 	buf = append(buf, res.Payload...)
 	if _, err := conn.Write(buf); err != nil {
+		s.diag.Error("WRITE_ERROR", err)
 		return fmt.Errorf("WRITE_ERROR: %w", err)
 	}
+	s.diag.TX(uint32(res.Command), uint64(len(buf)), conn.RemoteAddr().String())
 	return nil
 }
 
@@ -253,13 +259,23 @@ func buildMediaCaptureAckPayload(request []byte) []byte {
 // Handling individual TCP Connection/Client
 func (s *MediaControl) handleConn(conn net.Conn) {
 	s.tracker.Add(conn)
+	s.diag.OpenConn(conn.LocalAddr().String(), conn.RemoteAddr().String(), conn)
+	closeReason := "REMOTE_OR_LOCAL_CLOSE"
 	defer func() {
+		s.diag.Close(closeReason)
 		s.tracker.Remove(conn)
 		_ = conn.Close()
 		s.wg.Done()
 	}()
 
 	reader := bufio.NewReader(conn)
+
+	// Stesso keepalive breve del PXC: anche qui la connessione e' di controllo
+	// e una morte non rilevata porta il TFT a chiudere lo streaming.
+	if tcp, ok := conn.(*net.TCPConn); ok {
+		_ = tcp.SetKeepAlive(true)
+		_ = tcp.SetKeepAlivePeriod(15 * time.Second)
+	}
 
 	logging.Printf("Starting StreamCtrl Loop")
 	defer logging.Printf("Stopping StreamCtrl Loop")
@@ -269,15 +285,19 @@ func (s *MediaControl) handleConn(conn net.Conn) {
 		// Read 8 byte header
 		headerBytes := make([]byte, mediaCtrlHeaderSize)
 		if n, err := io.ReadFull(reader, headerBytes); err != nil {
+			closeReason = classifyReadErr(err)
+			s.diag.Error(closeReason, err)
 			s.emitError(
 				&CtrlError{
 					CtrlDecodeErr,
-					fmt.Errorf("error reading header: %v (read %d bytes: %x)", err, n, headerBytes[:n]),
+					fmt.Errorf("%s: error reading header: %v (read %d bytes: %x)", closeReason, err, n, headerBytes[:n]),
 					true,
 				})
 			return
 		}
 		if req, err := s.decodeHeader(headerBytes); err != nil {
+			closeReason = "PROTOCOL_ERROR"
+			s.diag.Error(closeReason, err)
 			s.emitError(
 				&CtrlError{
 					CtrlDecodeErr,
@@ -294,6 +314,9 @@ func (s *MediaControl) handleConn(conn net.Conn) {
 		if request.Size > 0 {
 			payload = make([]byte, request.Size)
 			if _, err := io.ReadFull(reader, payload); err != nil {
+				readReason := classifyReadErr(err)
+				closeReason = readReason
+				s.diag.Error(readReason, err)
 				s.emitError(
 					&CtrlError{
 						CtrlDecodeErr,
@@ -304,6 +327,7 @@ func (s *MediaControl) handleConn(conn net.Conn) {
 			}
 			request.Payload = payload
 		}
+		s.diag.RX(uint32(request.Command), uint64(mediaCtrlHeaderSize+len(payload)), conn.RemoteAddr().String())
 
 		// Decide what to do with the request
 		s.handleEvent(request, conn)

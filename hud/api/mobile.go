@@ -269,6 +269,23 @@ func (ms *MobileSession) SetEarlyClockPush(enabled bool) {
 	}
 }
 
+// SetClockPushCount imposta il numero di push della raffica iniziale
+// dell'ora (vedi clocksync.go): usato dall'app per bisezione.
+func (ms *MobileSession) SetClockPushCount(count int) {
+	if ms.hud != nil {
+		ms.hud.SetClockPushCount(count)
+	}
+}
+
+// PxcDiagnosticsSnapshot returns low-frequency aggregate counters and monotonic
+// ages for PXC traffic. It does not expose raw events or payloads.
+func (ms *MobileSession) DiagnosticsSnapshot() string {
+	if ms.hud == nil {
+		return "HUD unavailable"
+	}
+	return ms.hud.DiagnosticsSnapshot()
+}
+
 func (ms *MobileSession) StartSession() error {
 	ctxWithTimeout, cancel := context.WithTimeout(context.Background(), time.Duration(ms.cfg.StartupTimeoutSec)*time.Second)
 	defer cancel()

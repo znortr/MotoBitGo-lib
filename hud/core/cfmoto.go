@@ -102,12 +102,17 @@ func NewCfmotoHUD(targetFPS int, mux *stream.MuxSource) *CfmotoHUD {
 			SupportH264IFrame:     true,
 			AppVersionFingerPrint: "V:2.2.1(121)--ONLINE",
 		},
-		targetFPS:             targetFPS,
+		targetFPS: targetFPS,
+		// Clock push: UNA sola consegna dell'ora per connessione (non il burst
+		// storico 60x250ms che intasava la finestra TCP e causava le chiusure a
+		// ~14 minuti, ne' l'assenza totale che riportava il display a 00.MM).
+		// Il keepalive ogni 5 minuti (startKeepaliveClockPush) mantiene vivo
+		// il canale; la risposta alla richiesta 0x10450 del TFT resta attiva.
 		earlyClockPushEnabled: true,
 		muxSource:             mux,
 		stopped:               make(chan any),
-		Events:    make(chan HudEvent, 32),
-		Errors:    make(chan error, 32),
+		Events:                make(chan HudEvent, 32),
+		Errors:                make(chan error, 32),
 	}
 }
 
@@ -142,17 +147,34 @@ func (hud *CfmotoHUD) isFatalErr(err error) bool {
 	return false
 }
 
+// nonFatalErr riporta all'app un errore come NON fatale. Serve a distinguere
+// "la sessione e' persa" da "un canale e' caduto ma il resto funziona": l'app
+// riconnette solo sugli errori fatali.
+type nonFatalErr struct{ error }
+
+func (nonFatalErr) IsFatal() bool { return false }
+
 func (hud *CfmotoHUD) handleServerError(err error) {
 	if err == nil {
 		return
 	}
 
-	// Bubble up error
+	// Un guasto del solo canale di controllo (PXC :10922) NON deve abbattere la
+	// sessione. Dai log: il PXC muore con READ_TIMEOUT mentre i frame su :10920
+	// continuano a scorrere; era il nostro StopStream a chiudere gli altri canali
+	// e a riportare il TFT alla schermata QR. Il listener su :10922 resta aperto,
+	// quindi l'HU puo' riaprire il canale da solo.
+	reported := err
+	if _, isPxc := err.(*net.PxcError); isPxc && hud.IsRunning() {
+		reported = nonFatalErr{err}
+	}
+
+	// Bubble up error (con la fatalita' corretta per l'app)
 	select {
-	case hud.Errors <- err:
+	case hud.Errors <- reported:
 	default:
 	}
-	if hud.isFatalErr(err) {
+	if hud.isFatalErr(reported) {
 		// Fatal, we need to exit cleanly
 		go func() {
 			ctxWithTimeout, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -338,7 +360,14 @@ func (hud *CfmotoHUD) startStream(ctx context.Context, initConn stdnet.Conn) (er
 			hud.handleServerError(pxcError)
 		}
 	}()
-	// hud.startPxcEventFwd(pxcServer) -- uncomment for testing only, too slow!
+	// NON inoltrare gli eventi PXC all'app.
+	//
+	// Verificato il 01/11: l'HU manda 0x80000010 a frequenza altissima (centinaia
+	// di pacchetti al secondo). Inoltrandolo, ogni evento attraversa JNI, scrive
+	// sul log e fa ridisegnare la UI: il main thread si satura, il mirroring si
+	// blocca e la sessione va in stallo. Il canale PXC si serve qui, in Go: l'app
+	// non ha bisogno di vederlo.
+	// hud.startPxcEventFwd(pxcServer)
 
 	mediaControl := net.NewMediaControl(":10921")
 	mediaControl.OnVideoStart = hud.muxSource.PrepareLiveConsumer
@@ -468,6 +497,49 @@ func (hud *CfmotoHUD) StopStream(ctx context.Context) error {
 	return nil
 }
 
+// DiagnosticsSnapshot returns one low-frequency aggregate for each TCP channel.
+func (hud *CfmotoHUD) DiagnosticsSnapshot() string {
+	hud.mu.Lock()
+	pxc := hud.pxcControl
+	mediaCtrl := hud.mediaControl
+	mediaStream := hud.mediaStream
+	running := hud.running
+	hud.mu.Unlock()
+
+	snapshot := func(name string, diag *net.ChannelDiagnostics) string {
+		if diag == nil {
+			return name + "=unavailable"
+		}
+		return name + "{" + diag.Snapshot(time.Now(), diag.ActiveConnections()) + "}"
+	}
+	var pxcDiag, ctrlDiag, streamDiag *net.ChannelDiagnostics
+	if pxc != nil {
+		pxcDiag = pxc.ChannelDiagnostics()
+	}
+	if mediaCtrl != nil {
+		ctrlDiag = mediaCtrl.ChannelDiagnostics()
+	}
+	if mediaStream != nil {
+		streamDiag = mediaStream.ChannelDiagnostics()
+	}
+
+	// Campi che il TFT dichiara all'handshake (PxcHudConf): sono i suoi
+	// parametri di sessione, tra cui il timeout socket su Wi-Fi sospettato
+	// responsabile della chiusura dello streaming.
+	confSummary := ""
+	if pxc != nil && pxc.HudConfig != nil {
+		confSummary = fmt.Sprintf(
+			" conf{socketTimeoutPeriodWifi=%ds supportMirrorReconnect=%t carBrand=%q carModel=%q}",
+			pxc.HudConfig.SocketTimeoutPeriodWifi,
+			pxc.HudConfig.SupportMirrorReconnect,
+			pxc.HudConfig.CarBrand, pxc.HudConfig.CarModel)
+	}
+
+	return fmt.Sprintf("running=%t targetFPS=%d %s %s %s%s", running, hud.targetFPS,
+		snapshot("PXC", pxcDiag), snapshot("MediaControl", ctrlDiag), snapshot("MediaStream", streamDiag),
+		confSummary)
+}
+
 func (hud *CfmotoHUD) IsRunning() bool {
 	hud.mu.Lock()
 	defer hud.mu.Unlock()
@@ -508,5 +580,17 @@ func (hud *CfmotoHUD) SetEarlyClockPush(enabled bool) {
 
 	if pxc != nil {
 		pxc.SetEarlyClockPush(enabled)
+	}
+}
+
+// SetClockPushCount imposta quante volte la raffica iniziale consegna l'ora
+// (vedi clocksync.go). Passato dall'app per la bisezione del numero minimo.
+func (hud *CfmotoHUD) SetClockPushCount(count int) {
+	hud.mu.Lock()
+	pxc := hud.pxcControl
+	hud.mu.Unlock()
+
+	if pxc != nil {
+		pxc.SetClockPushCount(count)
 	}
 }
