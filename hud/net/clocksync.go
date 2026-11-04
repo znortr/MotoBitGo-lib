@@ -2,6 +2,7 @@ package net
 
 import (
 	"encoding/json"
+	"net"
 	"time"
 
 	"github.com/charliecharlieO-o/motobit-ride-go/internal/logging"
@@ -98,8 +99,8 @@ func (s *PXCControl) startKeepaliveClockPush() {
 			case <-ticker.C:
 			}
 
-			conns := s.tracker.Snapshot()
-			if len(conns) == 0 {
+			hConn := s.getHeartbeatConn()
+			if hConn == nil {
 				continue
 			}
 
@@ -108,10 +109,8 @@ func (s *PXCControl) startKeepaliveClockPush() {
 				Body:    s.BuildClockReply(),
 			}
 
-			for _, conn := range conns {
-				if err := s.writeResponse(resp, conn, nil); err != nil {
-					logging.Printf("Keepalive clock push error to %s: %v", conn.RemoteAddr(), err)
-				}
+			if err := s.writeResponse(resp, hConn, nil); err != nil {
+				logging.Printf("Keepalive clock push error to %s: %v", hConn.RemoteAddr(), err)
 			}
 		}
 	}()
@@ -134,44 +133,75 @@ func (s *PXCControl) SetClockPushCount(count int) {
 // sendClockPushOnConnect consegna l'ora al TFT con una raffica di push non
 // richiesti (PxcTimeSyncAck) a intervalli di clockPushBurstPeriod, per
 // clockPushCount volte, appena aperta la connessione. Avviato da handleConn.
-func (s *PXCControl) sendClockPushOnConnect() {
+// sendClockPushOnConn consegna l'ora al TFT con una raffica di push non
+// richiesti (PxcTimeSyncAck) a intervalli di clockPushBurstPeriod, per
+// clockPushCount volte, sulla connessione di handshake iniziale (conn).
+func (s *PXCControl) sendClockPushOnConn(conn net.Conn) {
 	s.clockMu.Lock()
 	enabled := s.earlyPushEnabled
 	count := s.clockPushCount
 	s.clockMu.Unlock()
 
-	if !enabled || count == 0 {
+	// Se count == 1, l'utente ha scelto l'invio sincronizzato al primo frame:
+	// la raffica iniziale dell'handshake viene saltata.
+	if !enabled || count <= 1 || conn == nil {
 		return
 	}
 
-	go func() {
-		ticker := time.NewTicker(clockPushBurstPeriod)
-		defer ticker.Stop()
+	s.earlyPushOnce.Do(func() {
+		go func() {
+			ticker := time.NewTicker(clockPushBurstPeriod)
+			defer ticker.Stop()
 
-		for i := 0; i < count; i++ {
-			if i > 0 {
-				select {
-				case <-s.quit:
-					return
-				case <-ticker.C:
+			for i := 0; i < count; i++ {
+				if i > 0 {
+					select {
+					case <-s.quit:
+						return
+					case <-ticker.C:
+					}
 				}
-			}
 
-			conns := s.tracker.Snapshot()
-			if len(conns) == 0 {
-				return
-			}
-
-			resp := &PXCResponse{
-				Command: PxcTimeSyncAck,
-				Body:    s.BuildClockReply(),
-			}
-			for _, conn := range conns {
+				resp := &PXCResponse{
+					Command: PxcTimeSyncAck,
+					Body:    s.BuildClockReply(),
+				}
 				if err := s.writeResponse(resp, conn, nil); err != nil {
 					logging.Printf("Clock push %d/%d to %s: %v", i+1, count, conn.RemoteAddr(), err)
 				}
 			}
+			logging.Printf("Clock push raffica completata: %d push su socket %s", count, conn.RemoteAddr())
+		}()
+	})
+}
+
+// SendSingleClockPush invia 1 singolo pacchetto PxcTimeSyncAck alla moto,
+// sincronizzato con l'avvio del primo frame video.
+func (s *PXCControl) SendSingleClockPush() {
+	s.clockMu.Lock()
+	hConn := s.heartbeatConn
+	s.clockMu.Unlock()
+
+	if hConn == nil {
+		conns := s.tracker.Snapshot()
+		if len(conns) > 0 {
+			hConn = conns[0]
 		}
-		logging.Printf("Clock push raffica completata: %d push x %d connessione(i)", count, len(s.tracker.Snapshot()))
-	}()
+	}
+
+	if hConn == nil {
+		logging.Printf("SendSingleClockPush: nessuna connessione PXC disponibile")
+		return
+	}
+
+	resp := &PXCResponse{
+		Command: PxcTimeSyncAck,
+		Body:    s.BuildClockReply(),
+	}
+
+	if err := s.writeResponse(resp, hConn, nil); err != nil {
+		logging.Printf("SendSingleClockPush error to %s: %v", hConn.RemoteAddr(), err)
+	} else {
+		logging.Printf("SendSingleClockPush (1 pacchetto al primo frame) inviato con successo a %s", hConn.RemoteAddr())
+	}
 }

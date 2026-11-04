@@ -277,6 +277,13 @@ func (ms *MobileSession) SetClockPushCount(count int) {
 	}
 }
 
+// SendSingleClockPush invia 1 singolo pacchetto dell'ora alla moto.
+func (ms *MobileSession) SendSingleClockPush() {
+	if ms.hud != nil {
+		ms.hud.SendSingleClockPush()
+	}
+}
+
 // PxcDiagnosticsSnapshot returns low-frequency aggregate counters and monotonic
 // ages for PXC traffic. It does not expose raw events or payloads.
 func (ms *MobileSession) DiagnosticsSnapshot() string {

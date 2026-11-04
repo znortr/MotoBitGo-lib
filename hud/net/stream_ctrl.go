@@ -335,8 +335,8 @@ func (s *MediaControl) handleConn(conn net.Conn) {
 }
 
 func (s *MediaControl) Start() error {
-	// Create listener
-	ln, err := net.Listen("tcp", s.port)
+	// Create listener con SO_REUSEADDR e SO_REUSEPORT per evitare 'bind: address already in use'
+	ln, err := listenTCPReuse(s.port)
 	if err != nil {
 		return err
 	}

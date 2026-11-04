@@ -168,6 +168,9 @@ type PXCControl struct {
 	// per bisezione, default defaultClockPushCount.
 	clockPushCount int
 
+	heartbeatMu   sync.Mutex
+	heartbeatConn net.Conn
+
 	stopOnce sync.Once
 
 	Events      chan PXCResponse
@@ -192,6 +195,35 @@ func NewPXCControl(port string, kp *KeyPair, config *PhoneConfig) *PXCControl {
 		// ridebugile via SetClockPushCount per la bisezione.
 		clockPushCount: defaultClockPushCount,
 	}
+}
+
+func (s *PXCControl) setHeartbeatConn(conn net.Conn) {
+	s.heartbeatMu.Lock()
+	defer s.heartbeatMu.Unlock()
+	s.heartbeatConn = conn
+}
+
+func (s *PXCControl) getHeartbeatConn() net.Conn {
+	s.heartbeatMu.Lock()
+	defer s.heartbeatMu.Unlock()
+	return s.heartbeatConn
+}
+
+func (s *PXCControl) clearHeartbeatConn(conn net.Conn) {
+	s.heartbeatMu.Lock()
+	defer s.heartbeatMu.Unlock()
+	if s.heartbeatConn == conn {
+		s.heartbeatConn = nil
+	}
+}
+
+func (s *PXCControl) getHeartbeatConnAddr() string {
+	s.heartbeatMu.Lock()
+	defer s.heartbeatMu.Unlock()
+	if s.heartbeatConn != nil {
+		return s.heartbeatConn.RemoteAddr().String()
+	}
+	return "none"
 }
 
 func (s *PXCControl) ChannelDiagnostics() *ChannelDiagnostics { return s.diag }
@@ -346,9 +378,9 @@ func (s *PXCControl) handleEvent(event *PXCResponse, conn net.Conn) {
 				break
 			}
 			s.emitEvent(*response)
-			// Consegna dell'ora una volta per connessione (vedi clocksync.go):
-			// il TFT imposta l'orario solo da un push non sollecitato.
-			s.sendClockPushOnConnect()
+			// Consegna dell'ora una volta all'handshake sulla socket 1 (conn):
+			// il TFT imposta l'orario durante PxcHudConf nei primi 2.5s.
+			s.sendClockPushOnConn(conn)
 		}
 	case PxcSpeedConf:
 		s.emitEvent(*event)
@@ -390,13 +422,16 @@ func (s *PXCControl) handleEvent(event *PXCResponse, conn net.Conn) {
 			s.emitError(&PxcError{PxcWriteErr, err, true})
 		}
 	case PxcHeartbeat:
+		s.setHeartbeatConn(conn)
 		s.emitEvent(*event) // Necessary to indicate PXC finished
 		response := &PXCResponse{Command: PxcHeartbeatOk}
 		if err := s.writeResponse(response, conn, nil); err != nil {
 			s.emitError(&PxcError{PxcWriteErr, err, true})
 		}
 	case PxcCheckSnDone:
-		// The bike acknowledges the phone-originated CHECK_SN_RESULT.
+		// Il TFT conferma il completamento dell'handshake: azzeriamo qualsiasi read deadline
+		// sulla socket per garantire che l'inattivita' post-handshake non scateni mai READ_TIMEOUT.
+		_ = conn.SetReadDeadline(time.Time{})
 		s.emitEvent(*event)
 	case PxcTimeSync:
 		s.emitEvent(*event)
@@ -453,8 +488,8 @@ func (s *PXCControl) handleEvent(event *PXCResponse, conn net.Conn) {
 }
 
 func (s *PXCControl) Start() error {
-	// Create listener
-	ln, err := net.Listen("tcp", s.port)
+	// Create listener con SO_REUSEADDR e SO_REUSEPORT per evitare 'bind: address already in use'
+	ln, err := listenTCPReuse(s.port)
 	if err != nil {
 		return err
 	}
@@ -497,6 +532,7 @@ func (s *PXCControl) handleConn(conn net.Conn) {
 	s.diag.OpenConn(conn.LocalAddr().String(), conn.RemoteAddr().String(), conn)
 	closeReason := "REMOTE_OR_LOCAL_CLOSE"
 	defer func() {
+		s.clearHeartbeatConn(conn)
 		// Chiusura per-connessione: qui sappiamo quale socket si e' chiusa
 		// e non azzariamo anche le altre.
 		s.diag.CloseConn(conn.RemoteAddr().String(), closeReason)
@@ -514,6 +550,10 @@ func (s *PXCControl) handleConn(conn net.Conn) {
 		_ = tcp.SetKeepAlivePeriod(15 * time.Second)
 	}
 
+	// Disabilita qualsiasi read deadline/timeout sulla socket PXC:
+	// evita che l'inattivita' post-handshake faccia scattare il READ_TIMEOUT a 15/30 min.
+	_ = conn.SetReadDeadline(time.Time{})
+
 	reader := bufio.NewReader(conn)
 
 	logging.Printf("Starting PXC Loop")
@@ -525,6 +565,13 @@ func (s *PXCControl) handleConn(conn net.Conn) {
 		headerBytes := make([]byte, pxcHeaderSize)
 		if n, err := io.ReadFull(reader, headerBytes); err != nil {
 			closeReason = classifyReadErr(err)
+			if closeReason == "READ_TIMEOUT" {
+				// Come nell'app ufficiale Carbit (PXCSocketManager.java):
+				// Se la lettura va in timeout per inattivita', NON chiudiamo il socket e NON inviamo FIN.
+				// Azzeriamo la deadline e continuiamo il ciclo mantenendo il socket in stato ESTABLISHED.
+				_ = conn.SetReadDeadline(time.Time{})
+				continue
+			}
 			s.recordDiagError(closeReason, err)
 			s.emitError(&PxcError{
 				PxcDecodeErr,
@@ -565,6 +612,10 @@ func (s *PXCControl) handleConn(conn net.Conn) {
 			payload = make([]byte, request.Size-pxcHeaderSize)
 			if _, err := io.ReadFull(reader, payload); err != nil {
 				closeReason = classifyReadErr(err)
+				if closeReason == "READ_TIMEOUT" {
+					_ = conn.SetReadDeadline(time.Time{})
+					continue
+				}
 				s.recordDiagError(closeReason, err)
 				s.emitError(&PxcError{
 					PxcDecodeErr,

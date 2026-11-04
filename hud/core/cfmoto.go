@@ -59,6 +59,7 @@ type CfmotoHUD struct {
 	clockTZID             string
 	clockTZOffset         int
 	earlyClockPushEnabled bool
+	clockPushCount        int
 
 	// net management
 	keyPair      *net.KeyPair
@@ -334,12 +335,16 @@ func (hud *CfmotoHUD) startStream(ctx context.Context, initConn stdnet.Conn) (er
 	tzID := hud.clockTZID
 	tzOffset := hud.clockTZOffset
 	earlyPush := hud.earlyClockPushEnabled
+	pushCount := hud.clockPushCount
 	hud.mu.Unlock()
 
 	if tzID != "" {
 		pxcServer.SetClockTimeZone(tzID, tzOffset)
 	}
 	pxcServer.SetEarlyClockPush(earlyPush)
+	if pushCount > 0 {
+		pxcServer.SetClockPushCount(pushCount)
+	}
 
 	// PXC is ready
 	go func() {
@@ -587,10 +592,22 @@ func (hud *CfmotoHUD) SetEarlyClockPush(enabled bool) {
 // (vedi clocksync.go). Passato dall'app per la bisezione del numero minimo.
 func (hud *CfmotoHUD) SetClockPushCount(count int) {
 	hud.mu.Lock()
+	hud.clockPushCount = count
 	pxc := hud.pxcControl
 	hud.mu.Unlock()
 
 	if pxc != nil {
 		pxc.SetClockPushCount(count)
+	}
+}
+
+// SendSingleClockPush invia 1 singolo pacchetto PxcTimeSyncAck alla moto.
+func (hud *CfmotoHUD) SendSingleClockPush() {
+	hud.mu.Lock()
+	pxc := hud.pxcControl
+	hud.mu.Unlock()
+
+	if pxc != nil {
+		pxc.SendSingleClockPush()
 	}
 }
