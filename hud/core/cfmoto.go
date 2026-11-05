@@ -601,13 +601,15 @@ func (hud *CfmotoHUD) SetClockPushCount(count int) {
 	}
 }
 
-// SendSingleClockPush invia 1 singolo pacchetto PxcTimeSyncAck alla moto.
-func (hud *CfmotoHUD) SendSingleClockPush() {
+// SetPeriodicClockKeepalive attiva/disattiva il push dell'ora non richiesto
+// ogni 5 minuti sulla socket di controllo (vedi clocksync.go).
+// Default: disattivato (causa misurata dell'intasamento di :54612).
+func (hud *CfmotoHUD) SetPeriodicClockKeepalive(enabled bool) {
 	hud.mu.Lock()
 	pxc := hud.pxcControl
 	hud.mu.Unlock()
 
 	if pxc != nil {
-		pxc.SendSingleClockPush()
+		pxc.SetPeriodicClockKeepalive(enabled)
 	}
 }

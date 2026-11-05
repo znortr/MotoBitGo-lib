@@ -164,6 +164,10 @@ type PXCControl struct {
 	clockTZOffset    int
 	earlyPushOnce    sync.Once
 	earlyPushEnabled bool
+	// periodicKeepalive: push dell'ora non richiesto ogni 5 min (default OFF,
+	// causa misurata dell'intasamento della socket di controllo). Vedi
+	// startKeepaliveClockPush e SetPeriodicClockKeepalive.
+	periodicKeepalive bool
 	// Numero di push della raffica iniziale (vedi clocksync.go): configurabile
 	// per bisezione, default defaultClockPushCount.
 	clockPushCount int

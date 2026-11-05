@@ -277,10 +277,12 @@ func (ms *MobileSession) SetClockPushCount(count int) {
 	}
 }
 
-// SendSingleClockPush invia 1 singolo pacchetto dell'ora alla moto.
-func (ms *MobileSession) SendSingleClockPush() {
+// SetPeriodicClockKeepalive attiva/disattiva il push dell'ora non richiesto
+// ogni 5 minuti sulla socket di controllo PXC.
+// Default: DISATTIVATO — misurato che intasa la socket :54612.
+func (ms *MobileSession) SetPeriodicClockKeepalive(enabled bool) {
 	if ms.hud != nil {
-		ms.hud.SendSingleClockPush()
+		ms.hud.SetPeriodicClockKeepalive(enabled)
 	}
 }
 

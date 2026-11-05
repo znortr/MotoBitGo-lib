@@ -82,11 +82,18 @@ func (s *PXCControl) SetEarlyClockPush(enabled bool) {
 	s.earlyPushEnabled = enabled
 }
 
-// startKeepaliveClockPush invia PxcTimeSyncAck su tutte le connessioni PXC
-// attive ogni 5 minuti, per tutta la vita del controllo. Il watchdog del TFT
-// chiude la sessione (~14 minuti) se non riceve nulla dal telefono sulla
-// connessione heartbeat; il push periodico evita che il timer scatti.
-// Il traffico e' un pacchetto da ~120B ogni 300 s: trascurabile.
+// startKeepaliveClockPush invia PxcTimeSyncAck ogni keepaliveClockPushPeriod
+// sulla connessione heartbeat. DISATTIVATO PER DEFAULT.
+//
+// Misurato sui log del 05/11 (CHANNEL_DIAG, perConn 192.168.13.1:54612):
+// questo push NON viene letto dal TFT, resta in coda TCP non confermata con
+// RTO in backoff esponenziale (448ms -> 101s) e, poiche' TCP consegna in
+// ordine, BLOCCA gli ACK 0x10631 dovuti alle richieste periodiche del TFT
+// (0x10630). Il TFT resta senza risposta e chiude la socket ~48s dopo, poi
+// abbatte MediaStream ~73s dopo. Il TFT non ha bisogno di traffico non
+// richiesto: la sua richiesta 0x10630 (~ogni 60s) e' gia' la keepalive.
+//
+// Resta riattivabile a runtime (SetPeriodicClockKeepalive) per la bisazione.
 func (s *PXCControl) startKeepaliveClockPush() {
 	go func() {
 		ticker := time.NewTicker(keepaliveClockPushPeriod)
@@ -97,6 +104,13 @@ func (s *PXCControl) startKeepaliveClockPush() {
 			case <-s.quit:
 				return
 			case <-ticker.C:
+			}
+
+			s.clockMu.Lock()
+			enabled := s.periodicKeepalive
+			s.clockMu.Unlock()
+			if !enabled {
+				continue
 			}
 
 			hConn := s.getHeartbeatConn()
@@ -142,9 +156,9 @@ func (s *PXCControl) sendClockPushOnConn(conn net.Conn) {
 	count := s.clockPushCount
 	s.clockMu.Unlock()
 
-	// Se count == 1, l'utente ha scelto l'invio sincronizzato al primo frame:
-	// la raffica iniziale dell'handshake viene saltata.
-	if !enabled || count <= 1 || conn == nil {
+	// Raffica iniziale: si salta solo se disattivata o con conteggio 0.
+	// (L'opzione "1 pacchetto al primo frame" e' stata rimossa: il minimo e' 3.)
+	if !enabled || count <= 0 || conn == nil {
 		return
 	}
 
@@ -175,33 +189,12 @@ func (s *PXCControl) sendClockPushOnConn(conn net.Conn) {
 	})
 }
 
-// SendSingleClockPush invia 1 singolo pacchetto PxcTimeSyncAck alla moto,
-// sincronizzato con l'avvio del primo frame video.
-func (s *PXCControl) SendSingleClockPush() {
+// SetPeriodicClockKeepalive attiva/disattiva il push dell'ora NON richiesto
+// dal TFT ogni keepaliveClockPushPeriod. Default: disattivato (vedi commento
+// su startKeepaliveClockPush). Serve solo come interruttore di bisazione.
+func (s *PXCControl) SetPeriodicClockKeepalive(enabled bool) {
 	s.clockMu.Lock()
-	hConn := s.heartbeatConn
-	s.clockMu.Unlock()
-
-	if hConn == nil {
-		conns := s.tracker.Snapshot()
-		if len(conns) > 0 {
-			hConn = conns[0]
-		}
-	}
-
-	if hConn == nil {
-		logging.Printf("SendSingleClockPush: nessuna connessione PXC disponibile")
-		return
-	}
-
-	resp := &PXCResponse{
-		Command: PxcTimeSyncAck,
-		Body:    s.BuildClockReply(),
-	}
-
-	if err := s.writeResponse(resp, hConn, nil); err != nil {
-		logging.Printf("SendSingleClockPush error to %s: %v", hConn.RemoteAddr(), err)
-	} else {
-		logging.Printf("SendSingleClockPush (1 pacchetto al primo frame) inviato con successo a %s", hConn.RemoteAddr())
-	}
+	defer s.clockMu.Unlock()
+	s.periodicKeepalive = enabled
+	logging.Printf("Keepalive orologio periodico PXC: %t", enabled)
 }
