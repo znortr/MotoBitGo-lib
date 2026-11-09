@@ -50,9 +50,18 @@ func TestReadTCPInfoOnRealSocket(t *testing.T) {
 		c.Close()
 		t.Fatal("readTCPInfo ha restituito nil senza errore")
 	}
-	if info.Ca_state != 1 { // TCP_CA_OPEN = 1 su connessione sana
+	// TCP_CA_Open = 0 (enum del kernel: Open, Disorder, CWR, Recovery, Loss).
+	//
+	// Prima qui c'era `!= 1` con il commento "TCP_CA_OPEN = 1": sbagliato.
+	// Il valore 1 è TCP_CA_Disorder. Una connessione sana è Open = 0 (lo
+	// conferma il log dell'app: `tcp{retrans=0 timer=off ca=0}`).
+	//
+	// Il test gira solo su Linux/Android (`_linux_test.go`), quindi su Windows
+	// non veniva mai eseguito: l'errore si vedeva solo nella CI (ubuntu).
+	const tcpCaOpen = 0
+	if info.Ca_state != tcpCaOpen {
 		c.Close()
-		t.Fatalf("ca_state inatteso: %d", info.Ca_state)
+		t.Fatalf("ca_state inatteso: %d (atteso %d = TCP_CA_Open)", info.Ca_state, tcpCaOpen)
 	}
 
 	// Verifica anche il percorso del label: deve contenere i contatori.
